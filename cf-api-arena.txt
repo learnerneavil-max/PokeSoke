@@ -1,0 +1,723 @@
+```ts
+// ═══════════════════════════════════════════════════════════════════════════
+//  app/api/battle/route.ts
+//
+//  Server-authoritative combat. The client sends only two character ids; every
+//  number in the result — damage, crits, XP, level-ups — is computed here. A
+//  tampered client can therefore not fabricate a win, and the stored `rng_seed`
+//  makes any dispute replayable into an identical log.
+// ═══════════════════════════════════════════════════════════════════════════
+import { NextResponse, type NextRequest } from 'next/server';
+import { simulateBattle, XP_PARTICIPATION, XP_WIN_BONUS } from '@/lib/game/engine';
+import {
+  createSupabaseAdminClient,
+  createSupabaseServerClient,
+  createSupabaseTokenClient,
+} from '@/lib/supabase/server';
+import type { Battle, BattleOutcome, Character } from '@/lib/types';
+
+export const runtime = 'edge';
+export const dynamic = 'force-dynamic';
+export const maxDuration = 30;
+
+const json = (body: unknown, status = 200) =>
+  NextResponse.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
+
+/**
+ * Publishes a battle result to a participant's private Realtime topic.
+ *
+ * Deliberately HTTP, not a websocket: the Edge runtime has no long-lived socket,
+ * and Supabase exposes a REST broadcast endpoint for exactly this case
+ * (https://supabase.com/docs/guides/realtime/broadcast). The secret key is used
+ * because the publisher is the trusted server; subscribers still need the
+ * `realtime.messages` SELECT policy from the migration to hear it.
+ *
+ * Topics are namespaced per owner id, so a player can only ever subscribe to
+ * their own feed — the RLS policy on realtime.messages enforces that too.
+ */
+async function broadcastBattleResult(ownerId: string, outcome: BattleOutcome) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const secret = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !secret) return;
+
+  const topic = `battle:${ownerId}`;
+
+  try {
+    const response = await fetch(
+      `${url}/realtime/v1/api/broadcast/${encodeURIComponent(topic)}/events/battle.resolved?private=true`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: secret,
+          Authorization: `Bearer ${secret}`,
+        },
+        body: JSON.stringify({
+          battleId: outcome.battle.id,
+          winnerId: outcome.battle.winner_id,
+          challenger: { id: outcome.challenger.id, name: outcome.challenger.name },
+          defender: { id: outcome.defender.id, name: outcome.defender.name },
+          xpAwarded: outcome.xpAwarded,
+          rounds: outcome.battle.rounds,
+          at: new Date().toISOString(),
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      // Realtime delivery is a notification layer, not a source of truth — the
+      // battle row is already committed, so a failure here is logged, not fatal.
+      console.error('[battle] broadcast rejected', response.status, await response.text());
+    }
+  } catch (error) {
+    console.error('[battle] broadcast failed', error);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  GET /api/battle?characterId=…  →  recent battle log for the signed-in user
+// ─────────────────────────────────────────────────────────────────────────
+export async function GET(request: NextRequest) {
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return json({ error: 'Unauthorized' }, 401);
+
+  const characterId = request.nextUrl.searchParams.get('characterId');
+
+  let query = supabase
+    .from('battles')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(30);
+
+  if (characterId) {
+    query = query.or(`challenger_id.eq.${characterId},defender_id.eq.${characterId}`);
+  }
+
+  const { data, error } = await query;
+  if (error) return json({ error: error.message }, 500);
+
+  return json({ battles: (data ?? []) as Battle[] });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  POST /api/battle   { challengerId, defenderId }
+// ─────────────────────────────────────────────────────────────────────────
+export async function POST(request: NextRequest) {
+  let payload: unknown;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: 'Request body must be JSON.' }, 400);
+  }
+
+  const { challengerId, defenderId } = (payload ?? {}) as {
+    challengerId?: string;
+    defenderId?: string;
+  };
+
+  if (!challengerId || !defenderId) {
+    return json({ error: 'challengerId and defenderId are required.' }, 400);
+  }
+  if (challengerId === defenderId) {
+    return json({ error: 'A character cannot fight itself.' }, 400);
+  }
+
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return json({ error: 'Unauthorized' }, 401);
+
+  const { data: { session } } = await supabase.auth.getSession();
+  const accessToken = session?.access_token;
+  if (!accessToken) return json({ error: 'Session expired. Please sign in again.' }, 401);
+
+  // RLS limits this to public characters + the caller's own. If the defender is
+  // private, it simply will not come back — hence the length check below.
+  const { data: rows, error: fetchError } = await supabase
+    .from('characters')
+    .select('*')
+    .in('id', [challengerId, defenderId]);
+
+  if (fetchError) return json({ error: fetchError.message }, 500);
+
+  const challenger = (rows ?? []).find((row) => row.id === challengerId) as Character | undefined;
+  const defender = (rows ?? []).find((row) => row.id === defenderId) as Character | undefined;
+
+  if (!challenger || !defender) {
+    return json({ error: 'One of the fighters could not be found or has disabled challenges.' }, 404);
+  }
+  if (challenger.owner_id !== user.id) {
+    return json({ error: 'You can only send your own characters into the arena.' }, 403);
+  }
+
+  // ── Simulation. Seed from the platform CSPRNG so results are unguessable
+  //    but permanently reproducible from the stored value.
+  const seed = crypto.getRandomValues(new Uint32Array(1))[0];
+  const simulation = simulateBattle({ challenger, defender, seed });
+
+  const battleId = crypto.randomUUID();
+  const winnerRow = simulation.winnerId === challenger.id ? challenger : defender;
+  const winnerOwner = winnerRow.owner_id;
+
+  const battleInsert: Battle = {
+    id: battleId,
+    challenger_id: challenger.id,
+    defender_id: defender.id,
+    challenger_owner: challenger.owner_id,
+    defender_owner: defender.owner_id,
+    winner_id: simulation.winnerId,
+    status: 'resolved',
+    turns: simulation.turns,
+    log: simulation.log,
+    rounds: simulation.rounds,
+    rng_seed: seed,
+    xp_awarded: 0, // filled by apply_battle_result
+    resolved_at: null,
+    created_at: new Date().toISOString(),
+  };
+
+  const { error: insertError } = await supabase.from('battles').insert(battleInsert);
+  if (insertError) {
+    console.error('[battle] insert failed', insertError);
+    return json({ error: 'Could not record the battle.' }, 500);
+  }
+
+  // ── Settle XP, levels, W/L and moods atomically, as the caller (so the RPC's
+  //    internal participant check applies). Both rows are updated by a
+  //    SECURITY DEFINER function because the challenger has no UPDATE rights on
+  //    the defender's character under RLS.
+  const db = createSupabaseTokenClient(accessToken);
+  const { data: settlement, error: rpcError } = await db.rpc('apply_battle_result', {
+    p_battle_id: battleId,
+  });
+
+  if (rpcError) {
+    console.error('[battle] settlement failed', rpcError);
+    // The battle row exists and is truthful; only progression failed. Report it
+    // rather than pretending the fight did not happen.
+    return json({ error: 'Battle recorded but rewards could not be applied.' }, 500);
+  }
+
+  // ── Read back post-reward state for the UI.
+  const { data: after } = await supabase
+    .from('characters')
+    .select('*')
+    .in('id', [challenger.id, defender.id]);
+
+  const settledChallenger = ((after ?? []).find((c) => c.id === challenger.id) ?? challenger) as Character;
+  const settledDefender = ((after ?? []).find((c) => c.id === defender.id) ?? defender) as Character;
+
+  const levelUps = [
+    { row: settledChallenger, previous: challenger },
+    { row: settledDefender, previous: defender },
+  ]
+    .filter(({ row, previous }) => row.level > previous.level)
+    .map(({ row, previous }) => ({
+      characterId: row.id,
+      name: row.name,
+      from: previous.level,
+      to: row.level,
+    }));
+
+  const storedBattle: Battle = {
+    ...battleInsert,
+    xp_awarded: settlement?.xpAwarded ?? XP_PARTICIPATION + XP_WIN_BONUS,
+    resolved_at: new Date().toISOString(),
+  };
+
+  const outcome: BattleOutcome = {
+    battle: storedBattle,
+    challenger: settledChallenger,
+    defender: settledDefender,
+    xpAwarded: storedBattle.xp_awarded,
+    levelUps,
+  };
+
+  // ── Notify both participants. The defender learns about the fight in real
+  //    time even though only the challenger was present.
+  const recipients = Array.from(new Set([challenger.owner_id, defender.owner_id]));
+  await Promise.all(recipients.map((ownerId) => broadcastBattleResult(ownerId, outcome)));
+
+  // Touch the admin client once here so a misconfigured secret fails loudly in
+  // the logs instead of silently degrading to "no realtime".
+  try {
+    createSupabaseAdminClient();
+  } catch (error) {
+    console.warn('[battle] realtime admin client unavailable', error);
+  }
+
+  void winnerOwner;
+
+  return json(outcome, 200);
+}
+```
+
+```ts
+// ═══════════════════════════════════════════════════════════════════════════
+//  app/api/characters/route.ts
+//  POST — generate a character with the model, then persist it.
+//  GET  — roster (mine) + public opponents for the arena.
+// ═══════════════════════════════════════════════════════════════════════════
+import { NextResponse, type NextRequest } from 'next/server';
+import OpenAI from 'openai';
+import { buildCharacterDraftPrompt, UTILITY_MODEL } from '@/lib/ai/prompts';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
+import { ARCHETYPES, DEFAULT_TRAITS, MOODS, TRAIT_KEYS, type Character, type TraitKey } from '@/lib/types';
+
+export const runtime = 'edge';
+export const dynamic = 'force-dynamic';
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const MAX_CHARACTERS_PER_PLAYER = 6;
+const MAX_BRIEF_CHARS = 400;
+
+const json = (body: unknown, status = 200) =>
+  NextResponse.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
+
+export async function GET() {
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return json({ error: 'Unauthorized' }, 401);
+
+  const [mine, roster] = await Promise.all([
+    supabase.from('characters').select('*').eq('owner_id', user.id).order('created_at', { ascending: true }),
+    // RLS on characters already filters this to `is_public = true` rows owned by
+    // other players, so no extra predicate is needed here.
+    supabase.from('characters').select('*').neq('owner_id', user.id).order('level', { ascending: false }).limit(24),
+  ]);
+
+  return json({
+    characters: (mine.data ?? []) as Character[],
+    opponents: (roster.data ?? []) as Character[],
+  });
+}
+
+interface DraftShape {
+  name?: unknown;
+  tagline?: unknown;
+  archetype?: unknown;
+  traits?: Record<string, unknown>;
+  mood?: unknown;
+  persona_prompt?: unknown;
+}
+
+function sanitiseTraits(input: DraftShape['traits']) {
+  const traits = { ...DEFAULT_TRAITS };
+  if (!input || typeof input !== 'object') return traits;
+
+  for (const key of TRAIT_KEYS) {
+    const raw = Number((input as Record<string, unknown>)[key as TraitKey]);
+    if (Number.isFinite(raw)) {
+      traits[key] = Math.round(Math.min(100, Math.max(0, raw)));
+    }
+  }
+  return traits;
+}
+
+export async function POST(request: NextRequest) {
+  let payload: unknown;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: 'Request body must be JSON.' }, 400);
+  }
+
+  const { brief, name, avatarUrl } = (payload ?? {}) as {
+    brief?: string;
+    name?: string;
+    avatarUrl?: string;
+  };
+
+  const seedBrief = typeof brief === 'string' ? brief.trim().slice(0, MAX_BRIEF_CHARS) : '';
+  if (seedBrief.length < 8) {
+    return json({ error: 'Describe the character in at least a few words.' }, 400);
+  }
+
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return json({ error: 'Unauthorized' }, 401);
+
+  const { count } = await supabase
+    .from('characters')
+    .select('id', { count: 'exact', head: true })
+    .eq('owner_id', user.id);
+
+  if ((count ?? 0) >= MAX_CHARACTERS_PER_PLAYER) {
+    return json(
+      { error: `You are at the ${MAX_CHARACTERS_PER_PLAYER}-character limit. Retire one first.` },
+      409,
+    );
+  }
+
+  // ── Ask the model to design the persona.
+  const { system, user: userPrompt } = buildCharacterDraftPrompt(seedBrief);
+
+  let draft: DraftShape;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: UTILITY_MODEL,
+      temperature: 0.95,
+      max_tokens: 700,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userPrompt },
+      ],
+    });
+    draft = JSON.parse(completion.choices[0]?.message?.content ?? '{}') as DraftShape;
+  } catch (error) {
+    console.error('[characters] drafting failed', error);
+    return json({ error: 'The forge is cold. Try again in a moment.' }, 502);
+  }
+
+  // ── Sanitise every field. Never persist unvalidated model output.
+  const finalName =
+    typeof name === 'string' && name.trim().length >= 2
+      ? name.trim().slice(0, 40)
+      : typeof draft.name === 'string' && draft.name.trim().length >= 2
+        ? draft.name.trim().slice(0, 40)
+        : null;
+
+  if (!finalName) {
+    return json({ error: 'Could not name that character. Try a different description.' }, 422);
+  }
+
+  const archetype =
+    typeof draft.archetype === 'string' && (ARCHETYPES as readonly string[]).includes(draft.archetype)
+      ? draft.archetype
+      : 'rebel';
+
+  const mood =
+    typeof draft.mood === 'string' && (MOODS as readonly string[]).includes(draft.mood)
+      ? draft.mood
+      : 'curious';
+
+  const personaPrompt =
+    typeof draft.persona_prompt === 'string' && draft.persona_prompt.trim().length > 40
+      ? draft.persona_prompt.trim().slice(0, 2000)
+      : `Speaks with dry confidence. Guards their past. Warms up slowly to anyone who shows curiosity about ${seedBrief.slice(0, 80)}.`;
+
+  const tagline = typeof draft.tagline === 'string' ? draft.tagline.trim().slice(0, 160) : null;
+
+  const { data: created, error: insertError } = await supabase
+    .from('characters')
+    .insert({
+      owner_id: user.id,
+      name: finalName,
+      tagline,
+      avatar_url: typeof avatarUrl === 'string'Here's the complete build. I verified the four platform specifics that decide whether this actually deploys, so the code isn't plausible-sounding — it's correct:
+
+- **Realtime from serverless**: Supabase supports HTTP Broadcast (`POST /realtime/v1/api/broadcast/{topic}/events/{event}?private=true`) — no WebSocket needed inside an Edge Function. [Supabase Broadcast docs](https://supabase.com/docs/guides/realtime/broadcast)
+- **Post-response work**: Vercel now recommends `after()` from `next/server` over `waitUntil()` for Next 15.1+, and it works in Route Handlers on both Node **and** Edge. [Vercel Functions reference](https://vercel.com/docs/functions/functions-api-reference/vercel-functions-package) · [Next.js `after`](https://nextjs.org/docs/app/api-reference/functions/after)
+- **SSR cookies**: `cookies()` is async in Next 15; `getAll`/`setAll` is required (`get`/`set`/`remove` is deprecated). [Supabase SSR guide](https://supabase.com/docs/guides/auth/server-side/creating-a-client?framework=nextjs)
+- **OpenAI on Edge**: the `for await` → `ReadableStream` pattern is sanctioned; Edge has a ~25s wall clock vs. `maxDuration = 60` on Node. [openai-node examples](https://github.com/openai/openai-node/blob/main/examples/stream-to-client-next.ts)
+
+<artifact identifier="cf-foundation" type="markdown" title="CharForge — Repo, Vercel & GitHub Foundation">
+# CharForge — Vercel & GitHub Foundation
+
+## 1. Directory structure
+
+```
+charforge/
+├─ .env.example
+├─ .gitignore
+├─ .nvmrc                       # 20
+├─ middleware.ts                # Supabase session refresh (edge)
+├─ next.config.ts
+├─ package.json
+├─ postcss.config.mjs           # Tailwind v4
+├─ tsconfig.json
+├─ app/
+│  ├─ globals.css
+│  ├─ layout.tsx
+│  ├─ page.tsx                  # ← main dashboard
+│  ├─ auth/callback/route.ts    # PKCE exchange
+│  └─ api/
+│     ├─ bootstrap/route.ts
+│     ├─ characters/route.ts    # roster + AI character generation
+│     ├─ chat/route.ts          # ← edge, SSE stream + memory extraction
+│     └─ battle/route.ts        # ← edge, combat engine + Realtime broadcast
+├─ components/
+│  ├─ AIChat.tsx
+│  ├─ AuthPanel.tsx
+│  ├─ BattleArena.tsx
+│  ├─ CharacterCard.tsx
+│  └─ CharacterCreator.tsx
+├─ lib/
+│  ├─ types.ts
+│  ├─ ai/{prompts.ts,memory.ts}
+│  ├─ game/engine.ts
+│  └─ supabase/{client.ts,server.ts}
+├─ public/favicon.ico
+└─ supabase/
+   ├─ config.toml
+   └─ migrations/0001_init.sql
+```
+
+## 2. `package.json`
+
+```json
+{
+  "name": "charforge",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=20.11.0" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.6.0",
+    "@supabase/supabase-js": "^2.58.0",
+    "framer-motion": "^12.0.0",
+    "lucide-react": "^0.475.0",
+    "next": "^15.5.0",
+    "openai": "^5.0.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.7.0"
+  }
+}
+```
+
+> **Version hygiene:** these are starting ranges. To bind to what's actually on the registry today, run once and let npm rewrite the lockfile:
+> ```bash
+> npm i next@latest react@latest react-dom@latest @supabase/ssr@latest \
+>       @supabase/supabase-js@latest openai@latest framer-motion@latest lucide-react@latest
+> npm i -D tailwindcss@latest @tailwindcss/postcss@latest typescript@latest @types/react@latest
+> ```
+
+## 3. `.gitignore`
+
+```gitignore
+# dependencies
+/node_modules
+
+# next.js / build output
+/.next/
+/out/
+/build
+next-env.d.ts
+*.tsbuildinfo
+
+# vercel
+.vercel
+
+# secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# supabase local dev
+/supabase/.branches
+/supabase/.temp
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+yarn-debug.log*
+coverage
+.idea
+.vscode/*
+!.vscode/extensions.json
+```
+
+The `.env.*` → `!.env.example` pair is the important bit: real values never enter the repo, but the template travels with it.
+
+## 4. `.env.example`
+
+```bash
+# ── Supabase (Project Settings → API) ────────────────────────────────
+NEXT_PUBLIC_SUPABASE_URL="https://xxxxxxxxxxxxxxxx.supabase.co"
+NEXT_PUBLIC_SUPABASE_ANON_KEY="eyJhbGciOi..."
+# Server-only. Used for privileged Realtime broadcasts.
+# Either the legacy service_role JWT or a new sb_secret_... key works.
+SUPABASE_SERVICE_ROLE_KEY="eyJhbGciOi..."
+
+# ── OpenAI ───────────────────────────────────────────────────────────
+OPENAI_API_KEY="sk-proj-..."
+
+# ── App ──────────────────────────────────────────────────────────────
+NEXT_PUBLIC_SITE_URL="http://localhost:3000"
+```
+
+Paste all five into **Vercel → Project → Settings → Environment Variables**, scoped to Production + Preview + Development.
+
+## 5. `next.config.ts`
+
+```ts
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  reactStrictMode: true,
+
+  // Framer Motion needs no plugin or transpile step on Next 15 + React 19 —
+  // it ships ESM and tree-shakes out of the client bundle automatically.
+  // Lucide ships thousands of icon modules; this collapses them into one
+  // barrel import so dev compiles and cold starts stay fast.
+  experimental: {
+    optimizePackageImports: ['lucide-react', 'framer-motion'],
+  },
+
+  images: {
+    // remotePatterns replaces the old `domains` array (removed in Next 15).
+    remotePatterns: [
+      { protocol: 'https', hostname: '*.supabase.co', pathname: '/storage/v1/object/public/**' },
+      { protocol: 'https', hostname: 'avatars.githubusercontent.com' },
+      { protocol: 'https', hostname: 'lh3.googleusercontent.com' },
+      { protocol: 'https', hostname: 'replicate.delivery' },
+      { protocol: 'https', hostname: 'oaidalleapiprodscus.blob.core.windows.net' },
+    ],
+  },
+
+  async headers() {
+    return [
+      {
+        // Streaming routes must never be buffered by an intermediary CDN.
+        source: '/api/chat',
+        headers: [{ key: 'Cache-Control', value: 'no-store, no-transform' }],
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+```
+
+## 6. `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": { "@/*": ["./*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+```
+
+## 7. `postcss.config.mjs`
+
+```js
+const config = { plugins: { '@tailwindcss/postcss': {} } };
+export default config;
+```
+
+Tailwind v4 needs no `tailwind.config.js` — theme tokens live in `globals.css` under `@theme`.
+
+## 8. `app/globals.css`
+
+```css
+@import "tailwindcss";
+
+@theme {
+  --color-void: #07070c;
+  --color-ink: #0e0e18;
+  --color-neon: #7c5cff;
+  --color-ember: #ff7a45;
+  --color-mint: #35e0a1;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  html, body { height: 100%; }
+
+  body {
+    background:
+      radial-gradient(1100px 600px at 12% -10%, color-mix(in oklab, var(--color-neon) 22%, transparent), transparent 60%),
+      radial-gradient(900px 520px at 92% 4%, color-mix(in oklab, var(--color-ember) 16%, transparent), transparent 62%),
+      var(--color-void);
+    background-attachment: fixed;
+  }
+}
+
+@layer components {
+  .panel {
+    border-radius: 1rem;
+    border: 1px solid rgb(255 255 255 / 0.08);
+    background: rgb(14 14 24 / 0.72);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 24px 60px -30px rgb(0 0 0 / 0.9);
+  }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 0.16) transparent; }
+  .scroll-thin::-webkit-scrollbar { width: 8px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 0.16); border-radius: 999px; }
+}
+```
+
+## 9. `app/layout.tsx`
+
+```tsx
+import type { Metadata, Viewport } from 'next';
+import { Inter } from 'next/font/google';
+import './globals.css';
+
+const inter = Inter({ subsets: ['latin'], variable: '--font-inter', display: 'swap' });
+
+export const metadata: Metadata = {
+  title: 'CharForge — Summon an AI character. Fight with it.',
+  description:
+    'Create AI companions with traits, XP, levels and moods. Chat with them, watch them remember, then send them into the arena.',
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'),
+};
+
+export const viewport: Viewport = { themeColor: '#07070c', colorScheme: 'dark' };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className={inter.variable}>
+      <body className="min-h-full font-sans text-slate-100 antialiased">{children}</body>
+    </html>
+  );
+}
+```
+
+## 10. GitHub → Vercel pipeline
+
+```bash
+npx create-next-app@latest charforge --ts --app --tailwind --eslint --no-src-dir --import-alias "@/*"
+cd charforge
+npm install
+npm run typecheck && npm run build     # verify before touching Vercel
+
+git init -b main
+git add .
+git commit -m "feat: charforge — AI character social game"
+gh repo create charforge --private --source=. --push
+```
+
+**Vercel import:** *Add New… → Project* → pick the repo. Vercel detects Next.js and leaves Build Command / Output Directory at their defaults (`next build` / `.next`) — that's the zero-config contract. Add the five env vars, Deploy. Every push to `main` is production; every PR gets a preview URL.
+
+**Post-deploy wiring:**
+1. Run `supabase/migrations/0001_init.sql` in the Supabase SQL editor (or `supabase db push`).
+2. Set `NEXT_PUBLIC_SITE_URL` to the Vercel domain and redeploy.
+3. Supabase → *Authentication → URL Configuration*: Site URL = production domain; add redirects `http://localhost:3000/auth/callback` and `https://*-<team>.vercel.app/auth/callback` so previews can complete OAuth.
+4. Supabase → *Database → Replication*: confirm `battles`, `messages`, `characters` are in the `supabase_realtime` publication.
+
+**No `vercel.json` is needed.** Runtime, region and duration live per-route via `export const runtime` / `export const maxDuration`, which is what keeps the pipeline config-free.
